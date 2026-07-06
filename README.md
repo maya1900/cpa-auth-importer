@@ -1,7 +1,8 @@
 # CPA Auth File Importer
 
 作者：Victor ferline  
-主页：https://linux.do/u/victor_ferline/summary
+主页：https://linux.do/u/victor_ferline/summary  
+仓库：https://github.com/maya1900/cpa-auth-importer
 
 ## 文件
 
