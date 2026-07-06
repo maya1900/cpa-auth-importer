@@ -198,16 +198,31 @@ function normalizeUploadResult(data, fallbackNames) {
         error: String(item?.error ?? item?.message ?? "Unknown error").trim(),
       }))
     : [];
+  const skipped = Array.isArray(data?.skipped)
+    ? data.skipped
+        .map((item) => {
+          if (typeof item === "string") {
+            return { name: item.trim(), reason: "skipped" };
+          }
+          return {
+            name: String(item?.name ?? item?.file ?? "").trim(),
+            reason: String(item?.reason ?? item?.message ?? "skipped").trim(),
+          };
+        })
+        .filter((item) => item.name)
+    : [];
   const files = Array.isArray(data?.files)
     ? data.files.map((item) => String(item ?? "").trim()).filter(Boolean)
     : [];
-  const implicitSuccess = data?.uploaded === undefined && failed.length === 0;
+  const skippedNames = new Set(skipped.map((item) => item.name));
+  const implicitSuccess = data?.uploaded === undefined && failed.length === 0 && skipped.length === 0;
 
   return {
-    status: data?.status ?? (failed.length ? "partial" : "ok"),
+    status: data?.status ?? (failed.length || skipped.length ? "partial" : "ok"),
     uploaded: data?.uploaded ?? (implicitSuccess ? fallbackNames.length : 0),
-    files: files.length ? files : implicitSuccess ? [...fallbackNames] : [],
+    files: files.length ? files : implicitSuccess ? [...fallbackNames] : fallbackNames.filter((name) => !skippedNames.has(name)),
     failed,
+    skipped,
     raw: data,
   };
 }
@@ -253,8 +268,23 @@ async function verifyList(apiBase, key) {
         : data?.message || data?.error?.message || data?.error || response.statusText;
     throw new Error(`verify failed: HTTP ${response.status} ${message}`);
   }
-  const files = Array.isArray(data?.files) ? data.files : [];
+  const files = normalizeListedAuthFiles(data);
   return { total: data?.total ?? files.length, files };
+}
+
+function normalizeListedAuthFiles(data) {
+  const source = Array.isArray(data?.files) ? data.files : Array.isArray(data) ? data : [];
+  return source
+    .map((item) => {
+      if (typeof item === "string") return item.trim();
+      return String(item?.name ?? item?.file ?? item?.path ?? "").trim();
+    })
+    .filter(Boolean);
+}
+
+async function fetchExistingAuthNames(apiBase, key) {
+  const result = await verifyList(apiBase, key);
+  return new Set(result.files);
 }
 
 async function main() {
@@ -295,9 +325,28 @@ async function main() {
     return;
   }
 
+  console.log("Checking existing auth files...");
+  let existingNames = new Set();
+  try {
+    existingNames = await fetchExistingAuthNames(apiBase, options.key);
+  } catch (error) {
+    console.error(`Could not read existing auth files; continuing without pre-skip: ${error.message}`);
+  }
+  const existingFiles = files.filter((file) => existingNames.has(file.name));
+  const uploadFiles = files.filter((file) => !existingNames.has(file.name));
+
+  if (existingFiles.length) {
+    console.log(`Skipped existing files: ${existingFiles.length}`);
+    for (const file of existingFiles) {
+      console.log(`  - ${file.path} (already exists in CPA list)`);
+    }
+  }
+
   let uploaded = 0;
   const failed = [];
-  const batches = chunk(files, options.chunkSize);
+  const serverSkipped = [];
+  const uploadSkipped = [];
+  const batches = chunk(uploadFiles, options.chunkSize);
 
   for (let index = 0; index < batches.length; index += 1) {
     const batch = batches[index];
@@ -307,21 +356,53 @@ async function main() {
       const result = await uploadBatch(apiBase, options.key, batch, batchNumber, batches.length);
       uploaded += result.uploaded;
       for (const item of result.failed) {
-        failed.push(item);
+        serverSkipped.push({ name: item.name, reason: item.error });
       }
-      console.log(`  status=${result.status}, uploaded=${result.uploaded}, failed=${result.failed.length}`);
+      for (const item of result.skipped) {
+        serverSkipped.push(item);
+      }
+      console.log(`  status=${result.status}, uploaded=${result.uploaded}, failed=${result.failed.length}, skipped=${result.skipped.length}`);
     } catch (error) {
-      failed.push(...batch.map((file) => ({ name: file.name, error: error.message })));
-      console.error(`  ${error.message}`);
+      console.error(`  batch failed, retrying files one by one: ${error.message}`);
+      for (let fileIndex = 0; fileIndex < batch.length; fileIndex += 1) {
+        const file = batch[fileIndex];
+        try {
+          const result = await uploadBatch(apiBase, options.key, [file], `${batchNumber}.${fileIndex + 1}`, batches.length);
+          uploaded += result.uploaded;
+          for (const item of result.failed) {
+            serverSkipped.push({ name: item.name, reason: item.error });
+          }
+          for (const item of result.skipped) {
+            serverSkipped.push(item);
+          }
+          console.log(`  - ${file.name}: status=${result.status}, uploaded=${result.uploaded}, skipped=${result.failed.length + result.skipped.length}`);
+        } catch (itemError) {
+          uploadSkipped.push({ name: file.name, reason: itemError.message });
+          console.error(`  - ${file.name}: skipped after error: ${itemError.message}`);
+        }
+      }
     }
   }
 
   console.log("");
-  console.log(`Upload summary: uploaded=${uploaded}, failed=${failed.length}, attempted=${files.length}`);
+  const skippedTotal = existingFiles.length + serverSkipped.length + uploadSkipped.length;
+  console.log(`Upload summary: uploaded=${uploaded}, failed=${failed.length}, skipped=${skippedTotal}, attempted=${files.length}`);
   if (failed.length) {
     console.log("Failures:");
     for (const item of failed) {
       console.log(`  - ${item.name || "(unknown)"}: ${item.error}`);
+    }
+  }
+  if (serverSkipped.length) {
+    console.log("Server skipped:");
+    for (const item of serverSkipped) {
+      console.log(`  - ${item.name || "(unknown)"}: ${item.reason}`);
+    }
+  }
+  if (uploadSkipped.length) {
+    console.log("Upload errors skipped:");
+    for (const item of uploadSkipped) {
+      console.log(`  - ${item.name || "(unknown)"}: ${item.reason}`);
     }
   }
 

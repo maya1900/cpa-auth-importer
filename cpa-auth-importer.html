@@ -1178,6 +1178,7 @@
         state.completedBytes = 0;
         state.currentBatchBytes = 0;
         state.currentBatchLoaded = 0;
+        state.skipped = state.skipped.filter((item) => !["existing", "server", "upload", "upload-error"].includes(item.source));
         state.files.forEach((item) => {
           item.status = "pending";
           item.message = "";
@@ -1318,35 +1319,83 @@
               error: String((item && (item.error || item.message)) || "Unknown error").trim()
             }))
           : [];
+        const skipped = Array.isArray(data.skipped)
+          ? data.skipped.map((item) => {
+              if (typeof item === "string") return { name: item.trim(), reason: "已跳过" };
+              return {
+                name: String((item && (item.name || item.file)) || "").trim(),
+                reason: String((item && (item.reason || item.message)) || "已跳过").trim()
+              };
+            }).filter((item) => item.name)
+          : [];
         const files = Array.isArray(data.files)
           ? data.files.map((item) => String(item || "").trim()).filter(Boolean)
           : [];
-        const implicitSuccess = data.uploaded === undefined && failed.length === 0;
+        const skippedNames = new Set(skipped.map((item) => item.name));
+        const implicitSuccess = data.uploaded === undefined && failed.length === 0 && skipped.length === 0;
         return {
-          status: data.status || (failed.length ? "partial" : "ok"),
+          status: data.status || (failed.length || skipped.length ? "partial" : "ok"),
           uploaded: data.uploaded === undefined ? (implicitSuccess ? fallbackNames.length : 0) : data.uploaded,
-          files: files.length ? files : implicitSuccess ? fallbackNames : [],
-          failed
+          files: files.length ? files : implicitSuccess ? fallbackNames : fallbackNames.filter((name) => !skippedNames.has(name)),
+          failed,
+          skipped
         };
       }
 
       function markBatchResult(batch, result) {
         const failedByName = new Map(result.failed.map((item) => [item.name, item.error]));
+        const skippedByName = new Map(result.skipped.map((item) => [item.name, item.reason]));
         const successNames = new Set(result.files);
 
         batch.forEach((item) => {
           const error = failedByName.get(item.uploadName);
+          const skippedReason = skippedByName.get(item.uploadName);
           if (error) {
-            item.status = "failed";
-            item.message = error;
+            markUploadSkipped(item, error, "server");
+          } else if (skippedReason) {
+            markUploadSkipped(item, skippedReason, "server");
           } else if (!successNames.size || successNames.has(item.uploadName)) {
             item.status = "success";
             item.message = "已导入";
           } else {
-            item.status = "success";
-            item.message = "已提交";
+            markUploadSkipped(item, "服务端未返回导入确认", "server");
           }
         });
+      }
+
+      function markUploadSkipped(item, reason, source) {
+        item.status = "skipped";
+        item.message = reason || "上传失败，已跳过";
+        state.skipped.push({
+          name: item.displayName,
+          reason: item.message,
+          source: source || "upload"
+        });
+      }
+
+      async function getExistingAccountNames() {
+        const data = await apiRequest("/auth-files");
+        const accounts = normalizeAccounts(data);
+        state.accounts = accounts;
+        return new Set(accounts.map((account) => account.name));
+      }
+
+      function markExistingFilesAsSkipped(existingNames) {
+        const skipped = [];
+        state.files.forEach((item) => {
+          if (!existingNames.has(item.uploadName)) return;
+          item.status = "skipped";
+          item.message = "CPA 列表已存在，已跳过";
+          skipped.push(item);
+        });
+        if (skipped.length) {
+          state.skipped.push(...skipped.map((item) => ({
+            name: item.displayName,
+            reason: item.message,
+            source: "existing"
+          })));
+        }
+        return skipped;
       }
 
       function uploadBatch(apiBase, key, batch, batchIndex, batchTotal) {
@@ -1511,8 +1560,36 @@
         setStateBadge("导入中", "uploading");
         addLog(`开始导入，接口 ${apiBase}/auth-files。`);
 
-        const batches = chunk(state.files, chunkSize);
+        let existingNames;
+        try {
+          addLog("正在检查 CPA 已有账号列表。");
+          existingNames = await getExistingAccountNames();
+        } catch (error) {
+          existingNames = new Set();
+          addLog(`读取 CPA 账号列表失败，将继续导入但无法提前跳过已存在账号：${error.message}`);
+        }
+
+        const skippedExisting = markExistingFilesAsSkipped(existingNames);
+        if (skippedExisting.length) {
+          state.completedBytes += skippedExisting.reduce((sum, item) => sum + item.size, 0);
+          addLog(`已跳过 ${skippedExisting.length} 个 CPA 列表中已存在的账号。`);
+          skippedExisting.slice(0, 8).forEach((item) => addLog(`跳过 ${item.displayName}: CPA 列表已存在`));
+          if (skippedExisting.length > 8) addLog(`另有 ${skippedExisting.length - 8} 个已存在账号已跳过。`);
+        }
+
+        const uploadFiles = state.files.filter((item) => item.status !== "skipped");
+        const batches = chunk(uploadFiles, chunkSize);
         let stopped = false;
+
+        if (!batches.length) {
+          state.running = false;
+          el.startImport.disabled = false;
+          el.cancelImport.disabled = true;
+          setStateBadge("已完成", "success");
+          addLog(`导入结束：成功 0，失败 0，跳过 ${state.skipped.length}。`);
+          render();
+          return;
+        }
 
         for (let index = 0; index < batches.length; index += 1) {
           if (!state.running) {
@@ -1527,19 +1604,35 @@
             markBatchResult(batch, result);
             state.completedBytes += state.currentBatchBytes;
             state.currentBatchLoaded = 0;
-            addLog(`批次 ${index + 1} 完成：status=${result.status}, uploaded=${result.uploaded}, failed=${result.failed.length}`);
+            addLog(`批次 ${index + 1} 完成：status=${result.status}, uploaded=${result.uploaded}, skipped=${result.skipped.length + result.failed.length}`);
           } catch (error) {
-            batch.forEach((item) => {
-              item.status = "failed";
-              item.message = error.message;
-            });
-            state.completedBytes += state.currentBatchBytes;
-            state.currentBatchLoaded = 0;
-            addLog(`批次 ${index + 1} 失败：${error.message}`);
             if (!state.running) {
               stopped = true;
               break;
             }
+            addLog(`批次 ${index + 1} 失败，改为逐个文件继续导入：${error.message}`);
+            for (let itemIndex = 0; itemIndex < batch.length; itemIndex += 1) {
+              if (!state.running) {
+                stopped = true;
+                break;
+              }
+              const item = batch[itemIndex];
+              el.batchText.textContent = `${index + 1}.${itemIndex + 1} / ${batches.length}`;
+              try {
+                const result = await uploadBatch(apiBase, key, [item], `${index + 1}.${itemIndex + 1}`, batches.length);
+                markBatchResult([item], result);
+                state.completedBytes += state.currentBatchBytes;
+                state.currentBatchLoaded = 0;
+              } catch (itemError) {
+                markUploadSkipped(item, itemError.message, "upload-error");
+                state.completedBytes += item.size;
+                state.currentBatchBytes = 0;
+                state.currentBatchLoaded = 0;
+                addLog(`跳过 ${item.displayName}: ${itemError.message}`);
+              }
+              render();
+            }
+            if (stopped) break;
           }
           render();
         }
