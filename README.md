@@ -29,6 +29,10 @@ npm run dev
 - `/#/import`：批量导入
 - `/#/accounts`：账号管理
 
+GitHub Pages 会在每次推送到 `main` 后由 Actions 自动构建并部署：
+
+- https://maya1900.github.io/cpa-auth-importer/
+
 默认 CPA URL 为 `http://localhost:3000`，页面内没有内置个人域名或密钥。
 
 导入前会先读取 CPA 已有账号列表。列表中已存在的同名认证文件会标记为“跳过”，不会再次上传。
