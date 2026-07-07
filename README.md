@@ -60,3 +60,7 @@ node batch-import-auth-files.mjs --key 'your-key' --base http://localhost:3000 .
 ```bash
 node batch-import-auth-files.mjs --help
 ```
+
+## 许可证
+
+MIT License，Copyright (c) 2026 maya1900。
